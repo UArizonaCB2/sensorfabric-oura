@@ -1,1 +1,5 @@
-activity
+interbeatinterval
+sleep
+heartrate
+dailyactivity
+temperature

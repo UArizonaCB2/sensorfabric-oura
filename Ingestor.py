@@ -7,6 +7,8 @@ import os
 from utils import createTableWhitelist, uploadToAWS
 import re
 import logging
+from datetime import datetime
+import numpy as np
 
 """
 Pandas to Hadoop datatype mapper.
@@ -27,6 +29,24 @@ def _activity_modifier(df: pd.DataFrame()) -> pd.DataFrame():
     logger = logging.getLogger(__name__)
     logger.setLevel(logging.DEBUG)
 
+    # Extract the timezone offset from `day_start`. This is the only place
+    # where I currently see this offset avaliable.
+    day_start = df['day_start'].values
+    tz_offset = []  # Store the timezone offsets here.
+    for ds in day_start:
+        try:
+            dt = datetime.fromisoformat(ds)
+            tzname = dt.tzname()  # Example UTC-04:00
+            tzoffset = tzname[3:]  # Isolates -04:00
+            buff = tzoffset.split(':')
+            hrs = int(buff[0])
+            mins = int(buff[1])
+            tz_offset.append(hrs*60 + mins)
+
+        except ValueError:
+            logger.warn(f"Failed to convert {ds} into datetime for timezone extraction")
+            tz_offset.append(np.nan)
+
     # Change some of the fields to datetime64 at to utc timestamp.
     fields = ['summary_date', 'day_start', 'day_end']
     for field in fields:
@@ -41,6 +61,9 @@ def _activity_modifier(df: pd.DataFrame()) -> pd.DataFrame():
     df = df.rename(columns={'summary_date': 'summary_date_utc',
                             'day_start': 'day_start_utc',
                             'day_end': 'day_end_utc'})
+
+    # Finally add the timezone column to all of this.
+    df['tzoffset'] = tz_offset
 
     return df
 
@@ -67,11 +90,15 @@ def _temp_modifier(df: pd.DataFrame()) -> pd.DataFrame():
 
     return df
 
+def removeSensitive(df: pd.DataFrame()) -> pd.DataFrame():
+    """Remove any sensitive identifiers"""
+
+    df = df.drop(['email', 'group', 'name', 'participant_id'], axis=1)
+
+    return df
 
 # Modifier functions for specific tables. If a table has one then they will be called.
 MODIFIERS = {
-    'temp': _temp_modifier,
-    'activity': _activity_modifier,
 }
 
 def ingestor(directory, s3_path, database, mode='append'):
@@ -93,23 +120,22 @@ def ingestor(directory, s3_path, database, mode='append'):
 
     # Each file inside this directory is a table with Oura data information
     # that needs to be ingested.
-    exp = r'(?i)WOIA_(\d+)_(\w+)\.csv'
+    exp = r"^([a-z0-9]+)_(\d+)_([a-z]+)_(\d+)\.csv$"
     for filename in os.listdir(directory):
-        # We don't allow - in filenames. Convert all - to _ silently.
-        filename = filename.replace('-', '_')
-        match = re.match(exp, filename)
+        match = re.match(exp, filename, re.IGNORECASE)
 
         pid = None
         table_name = None
 
-        if match:
-            pid = match.group(1)
-            table_name = match.group(2)
+        if match and len(match.groups()) == 4:
+            table_name = match.group(1)
+            table_name = table_name.replace('-', '_')
+            pid = match.group(4)
         else:
             logger.warning(f'Skipping {os.path.join(directory, filename)} as name is of incorrect format.')
             continue
 
-        if not table_name in table_whitelist:
+        if table_name not in table_whitelist:
             # Silently skip this table name as its not in the whitelist
             continue
 
@@ -125,6 +151,8 @@ def ingestor(directory, s3_path, database, mode='append'):
             df = MODIFIERS[table_name](df)
             if df is None:
                 logger.error(f"Failed to ingest {os.path.join(directory, filename)}")
+
+        df = removeSensitive(df)
 
         # We are now ready to push this up to the SF backend.
         status, err = uploadToAWS(df, s3_path, database,

@@ -1,8 +1,6 @@
 #!/usr/bin/env python3
 
 import pandas as pd
-import awswrangler as wr
-import boto3
 import os
 from utils import createTableWhitelist, uploadToAWS
 import re
@@ -101,7 +99,7 @@ def removeSensitive(df: pd.DataFrame()) -> pd.DataFrame():
 MODIFIERS = {
 }
 
-def ingestor(directory, s3_path, database, mode='append'):
+def ingestor(directory, s3_path, database, specific_pid=None):
     """
     Function to correctly parse the directory structure, extract the data from the CSV files and then upload them to the correct AWS table.
 
@@ -139,6 +137,10 @@ def ingestor(directory, s3_path, database, mode='append'):
             # Silently skip this table name as its not in the whitelist
             continue
 
+        # If we have provided a specific PID then we only want to ingest that one.
+        if specific_pid is not None and not(pid == specific_pid):
+            continue
+
         # Open this CSV file and get the information as a dataframe.
         df = pd.read_csv(os.path.join(directory, filename))
 
@@ -155,8 +157,14 @@ def ingestor(directory, s3_path, database, mode='append'):
         df = removeSensitive(df)
 
         # We are now ready to push this up to the SF backend.
-        status, err = uploadToAWS(df, s3_path, database,
-                                  table_name, 'pid')
+        # Only push data to S3 if we are not running in dry run mode.
+        if os.getenv('ENVIRONMENT', 'PRODUCTION') == 'PRODUCTION':
+            status, err = uploadToAWS(df, s3_path, database,
+                                    table_name, 'pid')
+        else:
+            logger.info(f'Running in non-production mode (dry run), nothing will be uploaded')
+            status = True
+            err = None
 
         if not status:
             logger.error(f'Could not write file {os.path.join(directory, filename)} into table {table_name}')

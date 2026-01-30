@@ -1,5 +1,4 @@
-interbeatinterval
-sleep
-heartrate
-dailyactivity
-temperature
+dailyresilience
+dailysleep
+dailyspo2
+dailystress

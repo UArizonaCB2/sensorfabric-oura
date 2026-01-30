@@ -2,11 +2,12 @@
 
 import pandas as pd
 import os
-from utils import createTableWhitelist, uploadToAWS
+from utils import createTableWhitelist, uploadToAWS, uploadToClickHouse
 import re
 import logging
 from datetime import datetime
 import numpy as np
+from typing import Tuple, Optional
 
 """
 Pandas to Hadoop datatype mapper.
@@ -20,6 +21,10 @@ dtype_mapper = {
     'floating': 'double',
     'datetime64[ns]': 'timestamp',
 }
+
+# Global cache for ClickHouse table schemas
+# Key: table_name, Value: schema dictionary from DESCRIBE TABLE
+clickhouse_schema_cache = {}
 
 def _activity_modifier(df: pd.DataFrame()) -> pd.DataFrame():
     """Modifier mehtod for the activity table"""
@@ -88,10 +93,21 @@ def _temp_modifier(df: pd.DataFrame()) -> pd.DataFrame():
 
     return df
 
-def removeSensitive(df: pd.DataFrame()) -> pd.DataFrame():
+def removeSensitive(df: pd.DataFrame) -> pd.DataFrame:
     """Remove any sensitive identifiers"""
 
-    df = df.drop(['email', 'group', 'name', 'participant_id'], axis=1)
+    default_values = {
+        'email': 'foo@bar.org',
+        'group': 'g1',
+        'name': 'john doe',
+        'participant_id': '000-0000',
+    }
+
+    # Replace the sensitive columns with default values.
+    cols = df.columns
+    for col in cols:
+        if col in default_values:
+            df[col] = default_values[col]
 
     return df
 
@@ -99,15 +115,17 @@ def removeSensitive(df: pd.DataFrame()) -> pd.DataFrame():
 MODIFIERS = {
 }
 
-def ingestor(directory, s3_path, database, specific_pid=None):
+def ingestor(directory, database, s3_path:str='', specific_pid=None, storage='athena', clickhouse_client=None):
     """
-    Function to correctly parse the directory structure, extract the data from the CSV files and then upload them to the correct AWS table.
+    Function to correctly parse the directory structure, extract the data from the CSV files and then upload them to the correct storage backend.
 
     Parameters:
     directory(str) - Top level date folder path
-    s3_path (str) - S3 path where the parquet files will be stored
-    database (str) - AWS Glue/Athena database name
-    mode (str) - (Default) "append" to keep any possible existing table or  "overwrite" to recreate any possible existing table
+    database (str) - AWS Glue/Athena database name or ClickHouse database name
+    s3_path (str) - S3 path where the parquet files will be stored (for Athena backend)
+    specific_pid (str) - Only ingest data for this specific participant ID
+    storage (str) - Storage backend to use: 'athena' or 'clickhouse' (default: 'athena')
+    clickhouse_client - ClickHouse client connection (required if storage='clickhouse')
     """
 
     logger = logging.getLogger(__name__)
@@ -156,11 +174,16 @@ def ingestor(directory, s3_path, database, specific_pid=None):
 
         df = removeSensitive(df)
 
-        # We are now ready to push this up to the SF backend.
-        # Only push data to S3 if we are not running in dry run mode.
+        status = False
+        err = None
+
+        # We are now ready to push this up to the storage backend.
+        # Only push data if we are not running in dry run mode.
         if os.getenv('ENVIRONMENT', 'PRODUCTION') == 'PRODUCTION':
-            status, err = uploadToAWS(df, s3_path, database,
-                                    table_name, 'pid')
+            if storage == 'athena':
+                status, err = _backend_athena(df, database, table_name, s3_path)
+            elif storage == 'clickhouse':
+                status, err = _backend_clickhouse(df, table_name, clickhouse_client)
         else:
             logger.info(f'Running in non-production mode (dry run), nothing will be uploaded')
             status = True
@@ -171,3 +194,136 @@ def ingestor(directory, s3_path, database, specific_pid=None):
             logger.error(err)
 
     return True
+
+def _backend_athena(df: pd.DataFrame, database: str, table_name: str, s3_path: str) -> Tuple[bool, Optional[str]]:
+    """
+    Upload data to AWS Athena/Glue storage backend.
+
+    Parameters:
+    df (pd.DataFrame): Pandas DataFrame containing the data to upload
+    database (str): AWS Glue database name
+    table_name (str): AWS Glue table name
+    s3_path (str): S3 URI where parquet files will be stored
+
+    Returns:
+    Tuple[bool, Optional[str]]: (True, None) on success, (False, error_message) on failure
+
+    Notes:
+    Clickhouse automatically converts DateTime64[ns] to epoch values internally using the timezone
+    information present in the datetime string. Hence it is always best to pass it timezone aware
+    stirng only. If a timezone naive string is passed then it will interepret it as being the systems local
+    timezone and cause all sorts of confusion. 
+    """
+    status, err = uploadToAWS(df, s3_path, database, table_name, 'pid')
+
+    return status, err
+
+def _backend_clickhouse(df: pd.DataFrame, table_name: str, clickhouse_client: Optional[object]) -> Tuple[bool, Optional[str]]:
+    """
+    Upload data to ClickHouse storage backend.
+
+    Parameters:
+    df (pd.DataFrame): Pandas DataFrame containing the data to upload
+    table_name (str): ClickHouse table name
+    clickhouse_client (Optional[object]): ClickHouse client connection object (required for upload)
+
+    Returns:
+    Tuple[bool, Optional[str]]: (True, None) on success, (False, error_message) on failure
+    """
+    global clickhouse_schema_cache
+
+    logger = logging.getLogger(__name__)
+    logger.setLevel(logging.DEBUG)
+
+    if clickhouse_client is None:
+        logger.error('ClickHouse client is required when using clickhouse storage backend')
+        status = False
+        err = 'ClickHouse client not provided'
+        return status, err
+
+    # Check if table schema is cached
+    if table_name not in clickhouse_schema_cache:
+        logger.debug(f"Table {table_name} not in schema cache, querying ClickHouse...")
+
+        try:
+            # Query ClickHouse to check if table exists and get its schema
+            describe_result = clickhouse_client.query(f"DESCRIBE TABLE {table_name}")
+
+            # If we get here, table exists. Build schema from result
+            schema = {}
+            for row in describe_result.result_rows:
+                # Each row is (name, type, default_type, default_expression, comment, codec_expression, ttl_expression)
+                column_name = row[0]
+                column_type = row[1]
+                schema[column_name] = column_type
+
+            # Cache the schema
+            clickhouse_schema_cache[table_name] = schema
+            logger.info(f"Cached schema for table {table_name} with {len(schema)} columns")
+
+        except Exception as e:
+            # Table doesn't exist or query failed
+            logger.error(f"Table {table_name} not found in ClickHouse database. Ignoring this data. Error: {repr(e)}")
+            status = False
+            err = f"Table {table_name} does not exist in ClickHouse"
+            return status, err
+
+    # Process DataFrame to match ClickHouse schema
+    df = df.copy()  # Create a copy to avoid modifying the original
+    schema = clickhouse_schema_cache[table_name]
+
+    # Process DateTime/Date fields
+    for column_name, column_type in schema.items():
+        # Check if this is a DateTime or Date field in ClickHouse
+        if column_name not in df.columns:
+            logger.error(f"Mismatch between database schema and dataframe provided. Table: {table_name}, Missing column: {column_name}")
+            status = False
+            err = f"Column '{column_name}' exists in ClickHouse table '{table_name}' schema but not in provided DataFrame"
+            return status, err
+
+        # Handle DateTime fields
+        if 'DateTime' in column_type or 'Date' in column_type:
+            # Convert to pandas datetime if not already
+            if df[column_name].dtype != 'datetime64[ns]':
+                try:
+                    df[column_name] = pd.to_datetime(df[column_name])
+                except Exception as e:
+                    logger.error(f"Failed to convert column '{column_name}' to datetime for table '{table_name}'. ClickHouse expects DateTime but conversion failed: {repr(e)}")
+                    status = False
+                    err = f"Cannot convert column '{column_name}' to datetime as required by ClickHouse schema for table '{table_name}'"
+                    return status, err
+
+            # Check if datetime is timezone-aware by sampling first non-null element
+            sample_value = df[column_name].dropna().iloc[0] if len(df[column_name].dropna()) > 0 else None
+
+            if sample_value is not None and hasattr(sample_value, 'tzinfo') and sample_value.tzinfo is not None:
+                logger.debug(f"Column {column_name} has timezone-aware data, extracting offset...")
+
+                # Extract timezone offset for all rows and convert to minutes
+                tzoffset_minutes = []
+                for val in df[column_name]:
+                    if pd.isna(val):
+                        tzoffset_minutes.append(None)
+                    else:
+                        # Get UTC offset in seconds, convert to minutes
+                        offset_seconds = val.utcoffset().total_seconds()
+                        offset_minutes = int(offset_seconds / 60)
+                        tzoffset_minutes.append(offset_minutes)
+
+                # Add tzoffset column if it exists in schema
+                if 'tzoffset' in schema:
+                    df['tzoffset'] = tzoffset_minutes
+                    logger.debug(f"Added tzoffset column with values for {column_name}")
+
+        # Handle String fields - fill NaN values with empty string
+        elif 'String' in column_type:
+            # Replace NaN values with empty string
+            if df[column_name].isna().any():
+                null_count = df[column_name].isna().sum()
+                df[column_name] = df[column_name].fillna('')
+                logger.debug(f"Filled {null_count} NaN values with empty string in column '{column_name}'")
+
+    # Proceed with upload
+    status, err = uploadToClickHouse(df, clickhouse_client, table_name)
+
+    return status, err
